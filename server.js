@@ -35,7 +35,7 @@ const port = parseInt(process.env.PORT || '3001', 10); // Different port for bac
 
 const app = express();
 app.use(cors({
-  origin: envConfig.ALLOWED_ORIGINS,
+  origin: '*',
   credentials: true
 }));
 app.use(express.json());

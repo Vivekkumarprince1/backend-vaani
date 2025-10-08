@@ -1,22 +1,34 @@
 // Centralized env loader and validation
 const fs = require('fs');
 const path = require('path');
+// Load dotenv only in non-production by default to avoid accidentally
+// picking up checked-in .env files in production environments like Render.
+// Set DOTENV_FORCE_LOAD=true to force loading .env even in production.
 const dotenv = require('dotenv');
 
-// Load .env.local or .env if present — load early and only once
-const dotenvPath = (() => {
-  const local = path.resolve(process.cwd(), '.env.local');
-  const env = path.resolve(process.cwd(), '.env');
-  if (fs.existsSync(local)) return local;
-  if (fs.existsSync(env)) return env;
-  return null;
-})();
+const isProduction = process.env.NODE_ENV === 'production';
+const forceLoadDotenv = (process.env.DOTENV_FORCE_LOAD || '').toLowerCase() === 'true';
 
-if (dotenvPath) {
-  const parsed = dotenv.config({ path: dotenvPath });
-  if (parsed.error) {
-    // continue; env may already be set in environment
+let dotenvLoaded = false;
+if (!isProduction || forceLoadDotenv) {
+  // Load .env.local or .env if present — load early and only once
+  const dotenvPath = (() => {
+    const local = path.resolve(process.cwd(), '.env.local');
+    const env = path.resolve(process.cwd(), '.env');
+    if (fs.existsSync(local)) return local;
+    if (fs.existsSync(env)) return env;
+    return null;
+  })();
+
+  if (dotenvPath) {
+    const parsed = dotenv.config({ path: dotenvPath });
+    if (!parsed.error) {
+      dotenvLoaded = true;
+    }
   }
+} else {
+  // In production we intentionally skip loading .env files so platform-provided
+  // environment variables (Render, Heroku, etc.) are authoritative.
 }
 
 // Validate required environment variables early
@@ -31,6 +43,8 @@ if (missing.length) {
 }
 
 const config = {
+  // Important: expose NODE_ENV so callers can know the current environment
+  NODE_ENV: process.env.NODE_ENV || 'production',
   AZURE_SPEECH_KEY: process.env.AZURE_SPEECH_KEY || '',
   AZURE_SPEECH_REGION: process.env.AZURE_SPEECH_REGION || '',
   AZURE_SPEECH_ENDPOINT: process.env.AZURE_SPEECH_ENDPOINT || '',
@@ -58,6 +72,9 @@ const config = {
   HTTP_TIMEOUT_MS: parseInt(process.env.HTTP_TIMEOUT_MS || String(20 * 1000), 10),
  
 };
+
+// expose whether dotenv actually loaded a file (useful for debugging startup)
+config.DOTENV_LOADED = dotenvLoaded;
 
 // Small helper to require critical vars at runtime
 function requireEnv(name) {
