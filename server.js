@@ -40,6 +40,10 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// Ensure MongoDB is connected once at startup. Other modules may still call connectDB(),
+// but the implementation in `lib/db.js` is idempotent and will return the cached connection.
+const connectDB = require('./lib/db');
+
 // API Routes will be mounted here
 const authRoutes = require('./routes/auth');
 app.use('/api/auth', authRoutes);
@@ -54,6 +58,8 @@ const server = createServer(app);
 
 // Store active users and their rooms
 const users = {}; // Now keyed by socketId for proper audio translation lookup
+// Expose the in-memory connected users map to other modules (for online-only APIs)
+global.__connectedUsers = users;
 const rooms = {};
 
 // Helper function to find user by userId
@@ -129,6 +135,19 @@ setInterval(() => {
   });
 }, 5 * 60 * 1000);
 
-server.listen(port, '0.0.0.0', () => {
-  console.log(`Backend server running on port http://localhost:${port}`);
-});
+// Start server after ensuring MongoDB connection
+async function startServer() {
+  try {
+    await connectDB();
+  } catch (err) {
+    console.error('Failed to connect to MongoDB during startup. Exiting.');
+    console.error(err && err.message ? err.message : err);
+    process.exit(1);
+  }
+
+  server.listen(port, '0.0.0.0', () => {
+    console.log(`Backend server running on port http://localhost:${port}`);
+  });
+}
+
+startServer();

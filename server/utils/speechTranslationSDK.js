@@ -5,9 +5,19 @@ const cache = require('./translationCache');
 const pLimitModule = require('p-limit');
 const pLimit = (pLimitModule && pLimitModule.default) ? pLimitModule.default : pLimitModule;
 
-// Ensure required envs are present when this module is used
-const SPEECH_KEY = requireEnv('AZURE_SPEECH_KEY');
-const SPEECH_REGION = requireEnv('AZURE_SPEECH_REGION');
+// NOTE: don't require AZURE env vars at module import time. Some environments
+// (local dev without credentials, or CI) may not have these set and we don't
+// want the whole server to crash just because translation isn't configured.
+// Validate lazily when translation is actually invoked.
+
+function getSpeechCredentialsOrThrow() {
+  const key = config.AZURE_SPEECH_KEY;
+  const region = config.AZURE_SPEECH_REGION;
+  if (!key || !region) {
+    throw new Error('Azure Speech credentials missing: set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION to use speech translation');
+  }
+  return { key, region };
+}
 
 /**
  * Map language codes to Azure Speech Service locale codes
@@ -62,6 +72,7 @@ const toLanguageCode = (locale) => {
 // Simple in-memory pool for SpeechTranslationConfig per (key, region, sourceLocale + targets)
 const configPool = new Map();
 function getTranslationConfig(sourceLocale, targetLangCodes = []) {
+  const { key: SPEECH_KEY, region: SPEECH_REGION } = getSpeechCredentialsOrThrow();
   const key = [SPEECH_KEY, SPEECH_REGION, sourceLocale, targetLangCodes.join(',')].join('|');
   if (configPool.has(key)) return configPool.get(key);
   const c = sdk.SpeechTranslationConfig.fromSubscription(SPEECH_KEY, SPEECH_REGION);

@@ -4,6 +4,14 @@ const Room = require('../lib/models/Room');
 const { v4: uuidv4 } = require('uuid');
 
 class GroupCallController {
+  // In-memory timers for calls with single participant
+  // key: callId (string) -> timeoutId
+  static _noParticipantTimers = global.__groupCallNoParticipantTimers || new Map();
+  // Ensure global reference persists across modules
+  static _ensureGlobalTimerMap() {
+    if (!global.__groupCallNoParticipantTimers) global.__groupCallNoParticipantTimers = GroupCallController._noParticipantTimers;
+    else GroupCallController._noParticipantTimers = global.__groupCallNoParticipantTimers;
+  }
   /**
    * Get pending group call notifications for the current user
    */
@@ -134,25 +142,90 @@ class GroupCallController {
       await groupCall.populate('participants.userId', 'username email');
       await groupCall.populate('roomId', 'name participants');
 
-      // Emit socket event to notify all participants (single event with participant IDs)
+      // Emit socket event to notify all participants
+      console.log(`📞 Notifying ${room.participants.length} participants about group call in room: ${room.name}`);
+      
       try {
         if (global.__io) {
           const io = global.__io;
-          // Emit to all participants
+          let notificationsSent = 0;
+          const notifiedParticipants = new Set();
+          
+              // Prepare payload matching frontend expectation (updated)
+              const payload = {
+                callId: groupCall._id,
+                callRoomId: groupCall.callRoomId,
+                roomId: groupCall.roomId._id,
+                roomName: groupCall.roomId.name,
+                callType: groupCall.callType,
+                initiator: {
+                  _id: groupCall.initiator._id,
+                  username: groupCall.initiator.username,
+                  email: groupCall.initiator.email
+                },
+                participants: groupCall.participants.map(p => ({
+                  userId: p.userId._id,
+                  status: p.status,
+                  username: p.userId.username
+                }))
+              };
+          
+          // Fetch sockets in the chat room and notify each socket individually so we can exclude initiator
+          const roomSocketName = roomId.toString();
+          const socketsInRoom = await io.in(roomSocketName).fetchSockets();
+
+          if (socketsInRoom.length > 0) {
+            console.log(`   🎯 Found ${socketsInRoom.length} socket(s) in room ${roomSocketName}, sending individually (excluding initiator)`);
+          } else {
+            console.log(`   ℹ️ No sockets found in room ${roomSocketName}, will search all connected sockets`);
+          }
+
+          const allSockets = socketsInRoom.length > 0 ? socketsInRoom : Array.from(io.of('/').sockets.values());
+
+          // For each participant, find their sockets and emit the standard 'group_incoming_call' event, skipping initiator
           room.participants.forEach(participantId => {
-            const sockets = Array.from(io.of('/').sockets.values());
-            sockets.forEach(socket => {
-              if (socket.user && socket.user.userId === participantId.toString()) {
-                io.to(socket.id).emit('groupCallInitiated', {
-                  call: groupCall,
-                  roomId: roomId
-                });
-              }
+            const participantIdStr = participantId.toString();
+
+            // Skip initiator
+            if (participantIdStr === groupCall.initiator._id.toString()) {
+              return;
+            }
+
+            const participantSockets = allSockets.filter(socket => socket.user && socket.user.userId === participantIdStr);
+
+            if (participantSockets.length === 0) {
+              // No connected socket for this participant
+              return;
+            }
+
+            participantSockets.forEach(socket => {
+              console.log(`      ✅ Emitting 'group_incoming_call' to socket ${socket.id} for participant ${participantIdStr}`);
+              io.to(socket.id).emit('group_incoming_call', payload);
+              notificationsSent++;
+              notifiedParticipants.add(participantIdStr);
             });
           });
+          
+          console.log(`   📤 Sent ${notificationsSent} notifications to ${notifiedParticipants.size} unique participants`);
+          
+          // Update notification flags for all notified participants
+          groupCall.participants.forEach(participant => {
+            const participantIdStr = participant.userId._id.toString();
+            if (notifiedParticipants.has(participantIdStr)) {
+              participant.notificationSent = true;
+            }
+          });
+          
+          // Save updated notification flags
+          if (notificationsSent > 0) {
+            await groupCall.save();
+          }
+        } else {
+          console.warn('   ⚠️ Socket.IO instance not available (global.__io is undefined)');
         }
       } catch (err) {
-        console.error('Error emitting group call notification:', err);
+        console.error('❌ Error emitting group call notification:', err);
+        console.error('Error details:', err.stack);
       }
 
       return res.status(201).json({
@@ -297,6 +370,20 @@ class GroupCallController {
 
       await groupCall.save();
 
+      // Clear any pending "no participants" timer when someone joins
+      try {
+        GroupCallController._ensureGlobalTimerMap();
+        const timers = GroupCallController._noParticipantTimers;
+        const callIdStr = groupCall._id.toString();
+        if (timers.has(callIdStr)) {
+          clearTimeout(timers.get(callIdStr));
+          timers.delete(callIdStr);
+          console.log(`⏱️ Cleared no-participant timer for call ${callIdStr} because someone joined`);
+        }
+      } catch (e) {
+        console.warn('Failed to clear no-participant timer on join:', e);
+      }
+
       // Notify other participants
       try {
         if (global.__io) {
@@ -402,6 +489,69 @@ class GroupCallController {
         });
 
         await groupCall.save();
+      }
+
+      // If only one active participant remains, start a 30s timer to auto-end the call
+      try {
+        GroupCallController._ensureGlobalTimerMap();
+        const timers = GroupCallController._noParticipantTimers;
+        const callIdStr = groupCall._id.toString();
+
+        if (groupCall.activeParticipants.length === 1) {
+          // Clear existing timer if any
+          if (timers.has(callIdStr)) {
+            clearTimeout(timers.get(callIdStr));
+            timers.delete(callIdStr);
+          }
+
+          console.log(`⏱️ Starting no-participant timer for call ${callIdStr} (30s)`);
+          const t = setTimeout(async () => {
+            try {
+              // Re-fetch latest state
+              await dbConnect();
+              const fresh = await GroupCall.findById(callId);
+              if (!fresh) return;
+              if (fresh.activeParticipants.length <= 1 && fresh.status !== 'ended') {
+                // End the call
+                fresh.status = 'ended';
+                fresh.endedAt = new Date();
+                fresh.duration = Math.floor((fresh.endedAt - fresh.startedAt) / 1000);
+                fresh.participants.forEach(p => {
+                  if (p.status === 'invited') p.status = 'missed';
+                  else if (p.status === 'joined' && !p.leftAt) p.leftAt = fresh.endedAt;
+                });
+                await fresh.save();
+
+                // Emit event to notify all sockets in call room
+                if (global.__io) {
+                  try {
+                    const io = global.__io;
+                    io.to(fresh.callRoomId).emit('group_call_ended', { callId: fresh._id, reason: 'no_participants' });
+                    console.log(`📣 Emitted group_call_ended for call ${fresh._id} reason=no_participants`);
+                  } catch (e) {
+                    console.warn('Failed to emit group_call_ended:', e);
+                  }
+                }
+              }
+            } catch (e) {
+              console.error('Error in no-participant timer handler:', e);
+            } finally {
+              // Clean up timer map
+              try { timers.delete(callIdStr); } catch (e) {}
+            }
+          }, 30 * 1000);
+
+          timers.set(callIdStr, t);
+        } else {
+          // If more than one participant, ensure no timer is running
+          if (timers.has(callIdStr)) {
+            clearTimeout(timers.get(callIdStr));
+            timers.delete(callIdStr);
+            console.log(`⏱️ Cleared no-participant timer for call ${callIdStr} because participants increased`);
+          }
+        }
+      } catch (e) {
+        console.warn('Failed to manage no-participant timer on leave:', e);
       }
 
       // Notify other participants

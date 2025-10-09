@@ -124,6 +124,19 @@ router.get('/users', async (req, res) => {
 
     jwt.verify(token, process.env.JWT_SECRET);
 
+    // If caller requests online-only, use the in-memory socket-user map
+    const onlineOnly = req.query.online === 'true' || req.query.online === '1';
+
+    if (onlineOnly) {
+      // global.__connectedUsers is keyed by socketId -> { userId, username, ... }
+      const connected = global.__connectedUsers || {};
+      const onlineUserIds = new Set(Object.values(connected).map(u => String(u.userId)));
+
+      // Query DB for users with ids in onlineUserIds
+      const users = await User.find({ _id: { $in: Array.from(onlineUserIds) } }).select('-password');
+      return res.json(users);
+    }
+
     const users = await User.find().select('-password');
     return res.json(users);
   } catch (err) {
@@ -132,6 +145,42 @@ router.get('/users', async (req, res) => {
       return res.status(401).json({ error: 'Token is not valid' });
     }
     return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Logout endpoint: marks user offline and notifies other sockets
+router.post('/logout', authenticate, async (req, res) => {
+  try {
+    await connectDB();
+
+    const userId = req.user.userId || req.user.userId;
+    if (!userId) return res.status(400).json({ error: 'Invalid user' });
+
+    // Update DB status
+    const user = await User.findById(userId);
+    if (user) {
+      user.status = 'offline';
+      user.lastActive = Date.now();
+      await user.save();
+    }
+
+    // Remove any connected sockets for this user and notify others
+    const connected = global.__connectedUsers || {};
+    const io = global.__io;
+
+    Object.keys(connected).forEach(socketId => {
+      const u = connected[socketId];
+      if (String(u.userId) === String(userId)) {
+        // notify other clients
+        if (io) io.emit('userStatusChange', { userId, status: 'offline' });
+        delete connected[socketId];
+      }
+    });
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Logout error:', err);
+    return res.status(500).json({ error: 'Logout failed' });
   }
 });
 

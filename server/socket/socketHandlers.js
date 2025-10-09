@@ -241,6 +241,20 @@ module.exports = (io, users, rooms, findUserByUserId) => {
       }
     });
 
+    // Handle incomingCallAck - relay from callee to caller
+    socket.on('incomingCallAck', (data) => {
+      const { from, to, callSessionId } = data;
+      console.log(`📣 incomingCallAck from userId=${userId} (callee) to userId=${to || from} (caller)`);
+      
+      const callerUser = findUserByUserId(to || from);
+      if (callerUser) {
+        io.to(callerUser.socketId).emit('incomingCallAck', {
+          from: userId,
+          callSessionId: callSessionId
+        });
+      }
+    });
+
     // Group call events
     socket.on('joinGroupCall', (data) => {
       const { callRoomId, userId: joinUserId } = data;
@@ -248,7 +262,8 @@ module.exports = (io, users, rooms, findUserByUserId) => {
 
       socket.join(callRoomId);
 
-      socket.to(callRoomId).emit('userJoinedGroupCall', {
+      // Notify other participants in the call room that someone joined
+      socket.to(callRoomId).emit('participant_joined', {
         userId: joinUserId || userId,
         username: socket.user.username,
         socketId: socket.id
@@ -277,10 +292,11 @@ module.exports = (io, users, rooms, findUserByUserId) => {
 
       socket.leave(callRoomId);
 
-      socket.to(callRoomId).emit('userLeftGroupCall', {
+      socket.to(callRoomId).emit('participant_disconnected', {
         userId,
         username: socket.user.username,
-        socketId: socket.id
+        socketId: socket.id,
+        reason: 'left'
       });
     });
 
@@ -346,9 +362,21 @@ module.exports = (io, users, rooms, findUserByUserId) => {
           }
         }, 5 * 60 * 1000);
 
+        // Emit participant_disconnected to any call rooms the socket was part of
         Object.keys(rooms).forEach(roomId => {
           if (rooms[roomId]?.has(userId)) {
             rooms[roomId].delete(userId);
+            // Notify remaining sockets in that room
+            try {
+              socket.to(roomId).emit('participant_disconnected', {
+                userId,
+                username: socket.user.username,
+                reason: 'disconnect'
+              });
+            } catch (e) {
+              console.warn('Failed to emit participant_disconnected for room', roomId, e);
+            }
+
             if (rooms[roomId].size === 0) {
               delete rooms[roomId];
             }

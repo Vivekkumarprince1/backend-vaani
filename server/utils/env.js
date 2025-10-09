@@ -44,7 +44,7 @@ if (missing.length) {
 
 const config = {
   // Important: expose NODE_ENV so callers can know the current environment
-  NODE_ENV: process.env.NODE_ENV || 'production',
+  NODE_ENV: process.env.NODE_ENV || 'development',
   AZURE_SPEECH_KEY: process.env.AZURE_SPEECH_KEY || '',
   AZURE_SPEECH_REGION: process.env.AZURE_SPEECH_REGION || '',
   AZURE_SPEECH_ENDPOINT: process.env.AZURE_SPEECH_ENDPOINT || '',
