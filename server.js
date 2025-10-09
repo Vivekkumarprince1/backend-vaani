@@ -131,6 +131,7 @@ setInterval(() => {
     if (!socket) {
       console.log(`Removing stale user: socketId=${socketId}, userId=${user?.userId}`);
       delete users[socketId];
+      
     }
   });
 }, 5 * 60 * 1000);

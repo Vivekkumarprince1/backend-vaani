@@ -1,9 +1,10 @@
 const handleAudioTranslation = require('./audioHandler');
 const handleGroupCallAudioTranslation = require('./groupCallAudioHandler');
+const User = require('../../lib/models/User');
 
 module.exports = (io, users, rooms, findUserByUserId) => {
   // Handle socket connections
-  io.on('connection', (socket) => {
+  io.on('connection', async (socket) => {
     console.log('New client connected:', socket.id);
 
     const userId = socket.userId;
@@ -27,7 +28,17 @@ module.exports = (io, users, rooms, findUserByUserId) => {
       preferredLanguage: 'en' // Default, will be updated by updateLanguagePreference event
     };
 
-    console.log(`✅ User registered: socketId=${socket.id}, userId=${userId}, username=${username}`);
+    // Update user status in database
+    try {
+      await User.findByIdAndUpdate(userId, {
+        status: 'online',
+        lastActive: new Date(),
+        socketId: socket.id
+      });
+      console.log(`✅ User registered: socketId=${socket.id}, userId=${userId}, username=${username} - DB updated`);
+    } catch (error) {
+      console.error(`❌ Failed to update user status in DB for userId=${userId}:`, error);
+    }
 
     // Broadcast user online status
     socket.broadcast.emit('userStatusChange', {
@@ -341,9 +352,40 @@ module.exports = (io, users, rooms, findUserByUserId) => {
       });
     });
 
-    // Handle disconnect
-    socket.on('disconnect', () => {
-      console.log('Client disconnected:', socket.id);
+    // Handle explicit user logout
+    socket.on('userLogout', async () => {
+      console.log('User logout event received:', socket.id);
+      
+      const user = users[socket.id];
+      if (user) {
+        const userId = user.userId;
+        
+        // Update database immediately
+        try {
+          await User.findByIdAndUpdate(userId, {
+            status: 'offline',
+            lastActive: new Date(),
+            socketId: null
+          });
+          console.log(`✅ User logout DB updated for userId=${userId}`);
+        } catch (error) {
+          console.error(`❌ Failed to update user logout status in DB:`, error);
+        }
+
+        // Notify other clients
+        socket.broadcast.emit('userStatusChange', {
+          userId,
+          status: 'offline'
+        });
+
+        // Remove from memory
+        delete users[socket.id];
+      }
+    });
+
+    // Handle disconnect (browser close, network issues, etc.)
+    socket.on('disconnect', async (reason) => {
+      console.log('Client disconnected:', socket.id, 'Reason:', reason);
 
       const user = users[socket.id];
       if (user) {
@@ -351,16 +393,23 @@ module.exports = (io, users, rooms, findUserByUserId) => {
         user.status = 'offline';
         user.lastActive = new Date();
 
+        // Update database immediately
+        try {
+          await User.findByIdAndUpdate(userId, {
+            status: 'offline',
+            lastActive: new Date(),
+            socketId: null
+          });
+          console.log(`✅ User disconnect DB updated for userId=${userId}`);
+        } catch (error) {
+          console.error(`❌ Failed to update user disconnect status in DB:`, error);
+        }
+
+        // Broadcast offline status
         socket.broadcast.emit('userStatusChange', {
           userId,
           status: 'offline'
         });
-
-        setTimeout(() => {
-          if (users[socket.id]?.status === 'offline') {
-            delete users[socket.id];
-          }
-        }, 5 * 60 * 1000);
 
         // Emit participant_disconnected to any call rooms the socket was part of
         Object.keys(rooms).forEach(roomId => {
@@ -382,6 +431,31 @@ module.exports = (io, users, rooms, findUserByUserId) => {
             }
           }
         });
+
+        // Clean up from memory immediately
+        delete users[socket.id];
+      }
+    });
+
+    // Handle heartbeat/ping to update lastActive
+    socket.on('ping', async () => {
+      const user = users[socket.id];
+      if (user) {
+        user.lastActive = new Date();
+        
+        // Periodically update DB (throttled - every 30 seconds)
+        if (!user.lastDbUpdate || (Date.now() - user.lastDbUpdate) > 30000) {
+          user.lastDbUpdate = Date.now();
+          try {
+            await User.findByIdAndUpdate(user.userId, {
+              lastActive: new Date()
+            });
+          } catch (error) {
+            console.error('Failed to update lastActive in DB:', error);
+          }
+        }
+        
+        socket.emit('pong');
       }
     });
   });
