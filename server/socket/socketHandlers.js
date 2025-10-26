@@ -1,6 +1,7 @@
 const handleAudioTranslation = require('./audioHandler');
 const handleGroupCallAudioTranslation = require('./groupCallAudioHandler');
 const User = require('../../lib/models/User');
+const Chat = require('../../lib/models/Chat');
 
 module.exports = (io, users, rooms, findUserByUserId) => {
   // Handle socket connections
@@ -123,6 +124,82 @@ module.exports = (io, users, rooms, findUserByUserId) => {
 
       // Send confirmation back to sender
       socket.emit('messageSent', { success: true, message });
+    });
+
+    // Client acknowledges that a message was delivered to them
+    socket.on('messageDelivered', async (data) => {
+      const { messageId, clientTempId } = data || {};
+      if (!messageId) return;
+
+      try {
+        const updated = await Chat.findByIdAndUpdate(messageId, {
+          status: 'delivered',
+          deliveredAt: new Date()
+        }, { new: true });
+
+        if (updated) {
+          const senderId = (updated.sender || '').toString();
+          const ioInstance = global.__io;
+          if (ioInstance && senderId) {
+            const sockets = Array.from(ioInstance.of('/').sockets.values());
+            sockets.forEach(s => {
+              if (s.user && (s.user.userId === senderId || s.user.userId === senderId.toString())) {
+                console.log(`📨 Emitting messageStatusUpdate to sender (${senderId}): messageId=${messageId}, status=delivered`);
+                ioInstance.to(s.id).emit('messageStatusUpdate', {
+                  messageId: updated._id,
+                  status: 'delivered',
+                  clientTempId: clientTempId || null
+                });
+              }
+            });
+          }
+        }
+      } catch (err) {
+        console.error('Error marking message as delivered:', err);
+      }
+    });
+
+    // Client marks one or more messages as seen/read
+    socket.on('messageSeen', async (data) => {
+      const { messageIds } = data || {};
+      if (!messageIds || !Array.isArray(messageIds) || messageIds.length === 0) return;
+
+      console.log(`👁️ messageSeen received for ${messageIds.length} messages from user ${userId}`);
+
+      try {
+        const ioInstance = global.__io;
+
+        for (const mid of messageIds) {
+          try {
+            const updated = await Chat.findByIdAndUpdate(mid, {
+              status: 'seen',
+              seenAt: new Date()
+            }, { new: true });
+
+            if (updated) {
+              const senderId = (updated.sender || '').toString();
+              console.log(`📕 Message ${mid} marked as seen, notifying sender (${senderId})`);
+              
+              if (ioInstance && senderId) {
+                const sockets = Array.from(ioInstance.of('/').sockets.values());
+                sockets.forEach(s => {
+                  if (s.user && (s.user.userId === senderId || s.user.userId === senderId.toString())) {
+                    console.log(`   ✅ Emitting messageStatusUpdate (seen) to sender socket ${s.id}`);
+                    ioInstance.to(s.id).emit('messageStatusUpdate', {
+                      messageId: updated._id,
+                      status: 'seen'
+                    });
+                  }
+                });
+              }
+            }
+          } catch (innerErr) {
+            console.error('Failed to update seen for message', mid, innerErr);
+          }
+        }
+      } catch (err) {
+        console.error('Error processing messageSeen:', err);
+      }
     });
 
     // Handle typing indicator

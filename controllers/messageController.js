@@ -25,6 +25,8 @@ class MessageController {
         originalContent: content,
         content: content,
         originalLanguage,
+        // mark as sent when saved to DB
+        status: 'sent',
         timestamp: new Date(),
         translations: new Map()
       });
@@ -61,11 +63,19 @@ class MessageController {
             // Emit to the room so all joined sockets receive the saved message
             io.to(roomId).emit('receiveMessage', populatedMessage);
           } else if (receiverId) {
-            // Emit to the specific receiver's connected sockets
-            // Iterate sockets and send to those whose socket.user.userId matches receiverId
+            // Emit to the RECEIVER's connected sockets
             const sockets = Array.from(io.of('/').sockets.values());
             sockets.forEach(s => {
               if (s.user && (s.user.userId === receiverId || s.user.userId === receiverId.toString())) {
+                console.log(`📨 [messageController] Sending receiveMessage to receiver: socket ${s.id}`);
+                io.to(s.id).emit('receiveMessage', populatedMessage);
+              }
+            });
+            
+            // ALSO emit to SENDER so they can replace optimistic message with persisted one
+            sockets.forEach(s => {
+              if (s.user && (s.user.userId === decoded.userId || s.user.userId === decoded.userId.toString())) {
+                console.log(`📨 [messageController] Sending receiveMessage to sender: socket ${s.id}`);
                 io.to(s.id).emit('receiveMessage', populatedMessage);
               }
             });
@@ -73,6 +83,29 @@ class MessageController {
         }
       } catch (emitErr) {
         console.warn('Failed to emit saved message via Socket.IO:', emitErr);
+      }
+
+      // Inform sender sockets about the persisted status (sent)
+      try {
+        const io = global.__io;
+        if (io) {
+          const sockets = Array.from(io.of('/').sockets.values());
+          const msgId = populatedMessage._id || populatedMessage.id;
+          console.log(`✅ [messageController] Emitting messageStatusUpdate to sender (userId=${decoded.userId}): messageId=${msgId}, status=sent, clientTempId=${clientTempId}`);
+          
+          sockets.forEach(s => {
+            if (s.user && (s.user.userId === decoded.userId || s.user.userId === decoded.userId.toString())) {
+              console.log(`   📤 Sending to socket ${s.id}`);
+              io.to(s.id).emit('messageStatusUpdate', {
+                messageId: msgId,
+                status: 'sent',
+                clientTempId: clientTempId || null
+              });
+            }
+          });
+        }
+      } catch (statusErr) {
+        console.warn('Failed to emit messageStatusUpdate to sender sockets:', statusErr);
       }
 
       return res.status(201).json(populatedMessage);
